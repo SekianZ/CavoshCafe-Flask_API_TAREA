@@ -1,165 +1,258 @@
+# app.py - API SIMPLE PARA ESTUDIANTES
 from flask import Flask, request, jsonify
-from db import get_connection
+from datetime import datetime, timedelta
+import random
+from models import db, Cliente, CodigoVerificacion
 
 app = Flask(__name__)
 
+# ========================================
+# CONFIGURACIÓN DE LA BASE DE DATOS
+# ========================================
+app.config["SQLALCHEMY_DATABASE_URI"] = "mysql+mysqlconnector://root:@127.0.0.1:3306/CavoshCafe"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# 🟢 /api/login -> sp_getCliente
-@app.post("/api/login")
-def login():
-    data = request.get_json() or {}
-    correo = data.get("correo")
-    passwordd = data.get("passwordd")
-
-    if not correo or not passwordd:
-        return jsonify({
-            "success": False,
-            "data": None,
-            "message": "Faltan campos: correo y passwordd"
-        }), 400
-
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-
-    try:
-        cursor.execute("CALL sp_getCliente(%s, %s)", (correo, passwordd))
-        rows = cursor.fetchall()
-    finally:
-        cursor.close()
-        conn.close()
-
-    success = len(rows) > 0
-    data_resp = rows[0] if success else None
-    message = "Cliente registrado" if success else "Cliente no registrado"
-
-    return jsonify({
-        "success": success,
-        "data": data_resp,
-        "message": message
-    })
+db.init_app(app)
 
 
-# 🟦 /api/registrar -> sp_setCliente
+# ========================================
+# 1️⃣ REGISTRAR CLIENTE
+# ========================================
 @app.post("/api/registrar")
 def registrar():
-    data = request.get_json() or {}
+    # Obtener los datos del JSON
+    datos = request.get_json()
+    
+    id_cliente = int(datos.get("id", 0))
+    nombres = datos.get("nombres")
+    correo = datos.get("correo")
+    passwordd = datos.get("passwordd")
 
-    id_value = int(data.get("id", 0))
-    nombres = data.get("nombres")
-    correo = data.get("correo")
-    passwordd = data.get("passwordd")
-
+    # Validar que lleguen todos los campos
     if not nombres or not correo or not passwordd:
         return jsonify({
             "success": False,
-            "data": None,
-            "message": "Faltan campos: nombres, correo, passwordd"
+            "message": "Faltan datos: nombres, correo o passwordd"
         }), 400
 
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
+    # ========================================
+    # CASO 1: Crear nuevo cliente (id = 0)
+    # ========================================
+    if id_cliente == 0:
+        # Buscar si el correo ya existe
+        existe = Cliente.query.filter_by(Correo=correo).first()
+        
+        if existe:
+            return jsonify({
+                "success": False,
+                "message": "El correo ya está registrado"
+            })
 
-    try:
-        cursor.execute("CALL sp_setCliente(%s, %s, %s, %s)", (
-            id_value,
-            nombres,
-            correo,
-            passwordd
-        ))
-        rows = cursor.fetchall()  # autocommit evita problemas
-    finally:
-        cursor.close()
-        conn.close()
+        # Crear el nuevo cliente
+        nuevo_cliente = Cliente(
+            Nombres=nombres,
+            Correo=correo,
+            Passwordd=passwordd
+        )
+        
+        db.session.add(nuevo_cliente)
+        db.session.commit()
 
-    # 1) Si recién se creó
-    if id_value == 0 and len(rows) > 0 and "insertID" in rows[0]:
-        new_id = int(rows[0]["insertID"])
         return jsonify({
             "success": True,
+            "message": "Cliente registrado",
             "data": {
-                "id": new_id,
-                "nombres": nombres,
-                "correo": correo,
-                "passwordd": passwordd
-            },
-            "message": "Cliente registrado"
+                "id": nuevo_cliente.id,
+                "nombres": nuevo_cliente.Nombres,
+                "correo": nuevo_cliente.Correo
+            }
         })
 
-    # 2) Error del SP (correo repetido o cliente inexistente)
-    if len(rows) > 0 and "error" in rows[0]:
+    # ========================================
+    # CASO 2: Actualizar cliente (id > 0)
+    # ========================================
+    else:
+        # Buscar el cliente por ID
+        cliente = Cliente.query.get(id_cliente)
+        
+        if not cliente:
+            return jsonify({
+                "success": False,
+                "message": "Cliente no existe"
+            })
+
+        # Actualizar los datos
+        cliente.Nombres = nombres
+        cliente.Correo = correo
+        cliente.Passwordd = passwordd
+        
+        db.session.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Cliente actualizado"
+        })
+
+
+# ========================================
+# 2️⃣ LOGIN (INICIAR SESIÓN)
+# ========================================
+@app.post("/api/login")
+def login():
+    # Obtener datos del JSON
+    datos = request.get_json()
+    
+    correo = datos.get("correo")
+    passwordd = datos.get("passwordd")
+
+    # Validar que lleguen los campos
+    if not correo or not passwordd:
         return jsonify({
             "success": False,
-            "data": None,
-            "message": rows[0]["error"]
+            "message": "Faltan campos: correo y passwordd"
+        }), 400
+
+    # Buscar cliente con ese correo y contraseña
+    cliente = Cliente.query.filter_by(
+        Correo=correo,
+        Passwordd=passwordd
+    ).first()
+
+    # Si no existe
+    if not cliente:
+        return jsonify({
+            "success": False,
+            "message": "Correo o contraseña incorrectos"
         })
 
-    # 3) Update exitoso
+    # Si existe, devolver los datos
     return jsonify({
         "success": True,
-        "data": None,
-        "message": "Cliente actualizado"
+        "message": "Login exitoso",
+        "data": {
+            "id": cliente.id,
+            "nombres": cliente.Nombres,
+            "correo": cliente.Correo
+        }
     })
 
 
-# 🟡 /api/codigo -> sp_getClienteCodigo
+# ========================================
+# 3️⃣ GENERAR CÓDIGO DE VERIFICACIÓN
+# ========================================
 @app.post("/api/codigo")
 def generar_codigo():
-    data = request.get_json() or {}
-    correo = data.get("correo")
+    # Obtener el correo
+    datos = request.get_json()
+    correo = datos.get("correo")
 
     if not correo:
         return jsonify({
             "success": False,
-            "data": None,
-            "message": "Falta el campo: correo"
+            "message": "Falta el correo"
         }), 400
 
-    conn = None
-    cursor = None
-
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("CALL sp_getClienteCodigo(%s)", (correo,))
-        rows = cursor.fetchall()
-    except Exception:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    # Buscar si el cliente existe
+    cliente = Cliente.query.filter_by(Correo=correo).first()
+    
+    if not cliente:
         return jsonify({
             "success": False,
-            "data": None,
-            "message": "El servidor no está disponible"
-        }), 500
-
-    cursor.close()
-    conn.close()
-
-    # Caso correcto
-    if len(rows) > 0 and "codigo" in rows[0]:
-        return jsonify({
-            "success": True,
-            "data": {"codigo": rows[0]["codigo"]},
-            "message": "Cliente generado"
+            "message": "Correo no registrado"
         })
 
-    # Error del SP
-    if len(rows) > 0 and "error" in rows[0]:
-        return jsonify({
-            "success": False,
-            "data": None,
-            "message": rows[0]["error"]
-        })
+    # Generar un código de 4 dígitos al azar
+    codigo = str(random.randint(1000, 9999))
 
-    # Ultimo caso
+    # Calcular cuándo caduca (5 minutos después)
+    fecha_caducidad = datetime.utcnow() + timedelta(minutes=5)
+
+    # Guardar el código en la base de datos
+    nuevo_codigo = CodigoVerificacion(
+        idCliente=cliente.id,
+        Codigo=codigo,
+        FechaCaducidad=fecha_caducidad
+    )
+    
+    db.session.add(nuevo_codigo)
+    db.session.commit()
+
+    # Devolver el código (en producción se enviaría por correo)
     return jsonify({
-        "success": False,
-        "data": None,
-        "message": "No se pudo generar el código"
+        "success": True,
+        "message": "Código generado",
+        "data": {
+            "codigo": codigo  # ⚠️ Solo para pruebas
+        }
     })
 
 
-# 🟣 Servidor
+# ========================================
+# 4️⃣ VALIDAR CÓDIGO
+# ========================================
+@app.post("/api/validar-codigo")
+def validar_codigo():
+    # Obtener datos
+    datos = request.get_json()
+    
+    correo = datos.get("correo")
+    codigo = datos.get("codigo")
+
+    if not correo or not codigo:
+        return jsonify({
+            "success": False,
+            "message": "Faltan campos: correo y codigo"
+        }), 400
+
+    # Buscar el cliente
+    cliente = Cliente.query.filter_by(Correo=correo).first()
+    
+    if not cliente:
+        return jsonify({
+            "success": False,
+            "message": "Correo no registrado"
+        })
+
+    # Buscar el código más reciente de ese cliente
+    codigo_db = CodigoVerificacion.query.filter_by(
+        idCliente=cliente.id,
+        Codigo=codigo
+    ).order_by(CodigoVerificacion.FechaCaducidad.desc()).first()
+
+    # Si no existe el código
+    if not codigo_db:
+        return jsonify({
+            "success": False,
+            "message": "Código incorrecto"
+        })
+
+    # Verificar si ya caducó
+    ahora = datetime.utcnow()  # ⚠️ Cambiar a utcnow()
+    
+    if ahora > codigo_db.FechaCaducidad:
+        return jsonify({
+            "success": False,
+            "message": "Código caducado"
+        })
+
+    # ✅ Código válido
+    return jsonify({
+        "success": True,
+        "message": "Código válido",
+        "data": {
+            "id": cliente.id,
+            "correo": cliente.Correo
+        }
+    })
+
+
+# ========================================
+# 🚀 INICIAR EL SERVIDOR
+# ========================================
 if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()  # Crea las tablas si no existen
+        print("✅ Base de datos lista")
+        print("🚀 Servidor corriendo en http://127.0.0.1:5000")
+
     app.run(debug=True, host="127.0.0.1", port=5000)
